@@ -1,24 +1,4 @@
 # unzippr
-<style>
-/* Show a small logo avatar to the left of the first heading */
-h1:first-of-type {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-h1:first-of-type::before {
-    content: "";
-    display: inline-block;
-    width: 48px;
-    height: 48px;
-    background-image: url("./public/favicon.jpeg");
-    background-size: contain;
-    background-repeat: no-repeat;
-    background-position: center;
-    border-radius: 8px;
-    flex: 0 0 48px;
-}
-</style>
 
 A minimal, stylish web app that lets you explore ZIP file contents without downloading them. Supports direct file upload and URL input with streaming download progress.
 
