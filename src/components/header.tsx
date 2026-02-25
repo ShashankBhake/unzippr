@@ -13,16 +13,24 @@ export function Header({ onReset }: HeaderProps) {
     return (
         <header className="flex items-center justify-between px-4 sm:px-6 py-3 border-b border-neutral-200 dark:border-neutral-800 glass-strong sticky top-0 z-50">
             <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2">
+                <button
+                    className="flex items-center gap-2 focus:outline-none group"
+                    onClick={() => {
+                        if (typeof window !== "undefined") {
+                            window.location.href = "/";
+                        }
+                    }}
+                    title="Go to home"
+                >
                     <img
                         src="/favicon.jpeg"
                         alt="unzippr"
-                        className="w-8 h-8 rounded-lg object-cover"
+                        className="w-8 h-8 rounded-lg object-cover group-hover:opacity-80 transition"
                     />
-                    <span className="text-lg font-bold tracking-tight">
+                    <span className="text-lg font-bold tracking-tight group-hover:text-brand-500 transition">
                         unzippr
                     </span>
-                </div>
+                </button>
             </div>
 
             <div className="flex items-center gap-1">

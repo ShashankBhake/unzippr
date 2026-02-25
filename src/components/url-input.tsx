@@ -31,9 +31,9 @@ export function UrlInput({ onSubmit, disabled }: UrlInputProps) {
     );
 
     return (
-        <form onSubmit={handleSubmit} className="space-y-2">
-            <div className="flex gap-2">
-                <div className="relative flex-1">
+        <form onSubmit={handleSubmit} className="space-y-2 w-full">
+            <div className="flex flex-col sm:flex-row gap-2 w-full">
+                <div className="relative flex-1 w-full">
                     <Link2 className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
                     <input
                         type="text"
@@ -43,14 +43,14 @@ export function UrlInput({ onSubmit, disabled }: UrlInputProps) {
                             if (error) setError("");
                         }}
                         placeholder="https://example.com/archive.zip"
-                        className="input-base pl-10"
+                        className="input-base pl-10 w-full"
                         disabled={disabled}
                     />
                 </div>
                 <button
                     type="submit"
                     disabled={disabled || !url.trim()}
-                    className="btn-primary"
+                    className="btn-primary w-full sm:w-auto"
                 >
                     {disabled ? (
                         <Loader2 className="w-4 h-4 animate-spin" />

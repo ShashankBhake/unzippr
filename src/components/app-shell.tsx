@@ -4,7 +4,12 @@ import React, { useState, useCallback, useRef, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 import { ZipState, ZipEntry, FILE_SIZE_LIMITS } from "@/lib/types";
 import { parseZipFromFile, parseZipFromUrl } from "@/lib/zip-handler";
-import type { Unzipped } from "@/lib/zip-handler";
+import type { Unzipped, RemoteZipHandle } from "@/lib/zip-handler";
+import {
+    scanAllFiles,
+    getSecuritySummary,
+    SecurityScanResult,
+} from "@/lib/magic-bytes";
 import { Header } from "./header";
 import { DropZone } from "./drop-zone";
 import { UrlInput } from "./url-input";
@@ -13,7 +18,7 @@ import { FileExplorer } from "./file-explorer";
 import { PreviewPanel } from "./preview-panel";
 import { StatsBar } from "./stats-bar";
 import { ErrorBanner } from "./error-banner";
-import { EmptyPreview } from "./empty-preview";
+import { ProjectDashboard } from "./project-dashboard";
 import { GridBackground } from "./grid-background";
 import { isValidUrl } from "@/lib/utils";
 import { FolderTree, Eye } from "lucide-react";
@@ -37,10 +42,21 @@ export function AppShell() {
     const [selectedEntry, setSelectedEntry] = useState<ZipEntry | null>(null);
     const [searchQuery, setSearchQuery] = useState("");
     const unzippedRef = useRef<Unzipped | null>(null);
+    const remoteHandleRef = useRef<RemoteZipHandle | null>(null);
     // Mobile: which panel is active — "files" or "preview"
     const [mobilePanel, setMobilePanel] = useState<"files" | "preview">(
         "files",
     );
+    // Multi-select for surgical extraction
+    const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+    const [selectMode, setSelectMode] = useState(false);
+    // Security scan
+    const [securityResults, setSecurityResults] = useState<Map<
+        string,
+        SecurityScanResult
+    > | null>(null);
+    // Source URL for "download original ZIP" shortcut
+    const [sourceUrl, setSourceUrl] = useState<string | null>(null);
 
     // Handle ?url= query param on mount
     useEffect(() => {
@@ -60,11 +76,36 @@ export function AppShell() {
         }));
     }, []);
 
+    // Run security scan after ZIP is loaded
+    const runSecurityScan = useCallback(
+        (entries: ZipEntry[], unzipped: Unzipped | null) => {
+            if (!unzipped) {
+                // Remote mode — scan only by extension (no bytes available)
+                const results = scanAllFiles(entries, () => null);
+                setSecurityResults(results);
+                return;
+            }
+            // Local mode — scan with actual bytes
+            const results = scanAllFiles(entries, (path) => {
+                const data = unzipped[path];
+                if (!data) return null;
+                return data.subarray(0, 16);
+            });
+            setSecurityResults(results);
+        },
+        [],
+    );
+
     const handleFileSelect = useCallback(
         async (file: File) => {
             setSelectedEntry(null);
             setSearchQuery("");
             unzippedRef.current = null;
+            remoteHandleRef.current = null;
+            setSelectedPaths(new Set());
+            setSelectMode(false);
+            setSecurityResults(null);
+            setSourceUrl(null);
 
             setZipState({
                 ...INITIAL_STATE,
@@ -80,8 +121,13 @@ export function AppShell() {
             );
             unzippedRef.current = unzipped;
             setZipState(result);
+
+            // Run security scan
+            if (result.status === "loaded" && unzipped) {
+                runSecurityScan(result.entries, unzipped);
+            }
         },
-        [handleProgress],
+        [handleProgress, runSecurityScan],
     );
 
     const handleUrlSubmit = useCallback(
@@ -89,6 +135,11 @@ export function AppShell() {
             setSelectedEntry(null);
             setSearchQuery("");
             unzippedRef.current = null;
+            remoteHandleRef.current = null;
+            setSelectedPaths(new Set());
+            setSelectMode(false);
+            setSecurityResults(null);
+            setSourceUrl(null);
 
             setZipState({
                 ...INITIAL_STATE,
@@ -96,22 +147,44 @@ export function AppShell() {
                 loadMethod: "url",
             });
 
-            const { state: result, unzipped } = await parseZipFromUrl(
-                url,
-                handleProgress,
-            );
+            const {
+                state: result,
+                unzipped,
+                remoteHandle,
+            } = await parseZipFromUrl(url, handleProgress);
             unzippedRef.current = unzipped;
+            remoteHandleRef.current = remoteHandle;
 
             setZipState(result);
+            setSourceUrl(url);
 
-            // Update URL for sharing
+            // Run security scan
+            if (result.status === "loaded") {
+                runSecurityScan(result.entries, unzipped);
+            }
+
+            // Update URL for sharing (deep linking)
             if (typeof window !== "undefined") {
                 const newUrl = new URL(window.location.href);
                 newUrl.searchParams.set("url", url);
                 window.history.replaceState({}, "", newUrl.toString());
             }
+
+            // Handle &path= deep link — auto-select file after load
+            if (result.status === "loaded") {
+                const pathParam = searchParams.get("path");
+                if (pathParam) {
+                    const entry = result.entries.find(
+                        (e) => e.path === pathParam,
+                    );
+                    if (entry && !entry.isDirectory) {
+                        setSelectedEntry(entry);
+                        setMobilePanel("preview");
+                    }
+                }
+            }
         },
-        [handleProgress],
+        [handleProgress, runSecurityScan, searchParams],
     );
 
     const handleReset = useCallback(() => {
@@ -119,10 +192,16 @@ export function AppShell() {
         setSelectedEntry(null);
         setSearchQuery("");
         unzippedRef.current = null;
+        remoteHandleRef.current = null;
+        setSelectedPaths(new Set());
+        setSelectMode(false);
+        setSecurityResults(null);
+        setSourceUrl(null);
 
         if (typeof window !== "undefined") {
             const newUrl = new URL(window.location.href);
             newUrl.searchParams.delete("url");
+            newUrl.searchParams.delete("path");
             window.history.replaceState({}, "", newUrl.toString());
         }
     }, []);
@@ -131,8 +210,37 @@ export function AppShell() {
         if (!entry.isDirectory) {
             setSelectedEntry(entry);
             setMobilePanel("preview"); // auto-switch to preview on mobile
+
+            // Deep link: update URL with &path= param
+            if (typeof window !== "undefined") {
+                const newUrl = new URL(window.location.href);
+                newUrl.searchParams.set("path", entry.path);
+                window.history.replaceState({}, "", newUrl.toString());
+            }
         }
     }, []);
+
+    const handleToggleSelect = useCallback((path: string) => {
+        setSelectedPaths((prev) => {
+            const next = new Set(prev);
+            if (next.has(path)) {
+                next.delete(path);
+            } else {
+                next.add(path);
+            }
+            return next;
+        });
+    }, []);
+
+    const handleToggleSelectAll = useCallback(() => {
+        const files = zipState.entries.filter((e) => !e.isDirectory);
+        setSelectedPaths((prev) => {
+            if (prev.size === files.length) {
+                return new Set(); // deselect all
+            }
+            return new Set(files.map((f) => f.path)); // select all
+        });
+    }, [zipState.entries]);
 
     const isIdle = zipState.status === "idle";
     const isLoading = zipState.status === "loading";
@@ -191,22 +299,25 @@ export function AppShell() {
                         />
 
                         {/* Limits info */}
-                        <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-4 text-[10px] sm:text-xs text-neutral-400 dark:text-neutral-500">
-                            <span>
-                                📁 Upload:{" "}
-                                <strong className="text-neutral-600 dark:text-neutral-300">
-                                    {FILE_SIZE_LIMITS.UPLOAD / 1024 / 1024}MB
-                                </strong>
-                            </span>
-                            <span>•</span>
-                            <span>
-                                🔗 URL:{" "}
-                                <strong className="text-neutral-600 dark:text-neutral-300">
-                                    {FILE_SIZE_LIMITS.URL / 1024 / 1024}MB
-                                </strong>
-                            </span>
-                            <span>•</span>
-                            <span>🔒 Client-side</span>
+                        <div className="flex flex-col xs:flex-row flex-wrap items-center justify-center gap-1.5 sm:gap-4 text-[11px] sm:text-xs text-neutral-400 dark:text-neutral-500 w-full mt-2">
+                            <div className="flex flex-row flex-wrap items-center gap-1.5">
+                                <span>
+                                    📁 Upload:{" "}
+                                    <strong className="text-neutral-600 dark:text-neutral-300">
+                                        {FILE_SIZE_LIMITS.UPLOAD / 1024 / 1024}
+                                        MB
+                                    </strong>
+                                </span>
+                                <span className="hidden xs:inline">•</span>
+                                <span>
+                                    🔗 URL:{" "}
+                                    <strong className="text-neutral-600 dark:text-neutral-300">
+                                        {FILE_SIZE_LIMITS.URL / 1024 / 1024}MB
+                                    </strong>
+                                </span>
+                                <span className="hidden xs:inline">•</span>
+                                <span>🔒 Client-side</span>
+                            </div>
                         </div>
                     </div>
                 </main>
@@ -229,7 +340,18 @@ export function AppShell() {
             {/* Loaded — Explorer view */}
             {isLoaded && (
                 <main className="flex-1 flex flex-col overflow-hidden animate-fade-in">
-                    <StatsBar zipState={zipState} onReset={handleReset} />
+                    <StatsBar
+                        zipState={zipState}
+                        onReset={handleReset}
+                        securityResults={securityResults}
+                        selectMode={selectMode}
+                        onToggleSelectMode={() => setSelectMode((m) => !m)}
+                        selectedPaths={selectedPaths}
+                        onToggleSelectAll={handleToggleSelectAll}
+                        unzipped={unzippedRef.current}
+                        remoteHandle={remoteHandleRef.current}
+                        sourceUrl={sourceUrl}
+                    />
 
                     {/* Mobile tab switcher */}
                     <div className="flex md:hidden border-b border-neutral-200 dark:border-neutral-800 shrink-0">
@@ -277,6 +399,10 @@ export function AppShell() {
                                 searchQuery={searchQuery}
                                 onSearchChange={setSearchQuery}
                                 onSelect={handleEntrySelect}
+                                selectMode={selectMode}
+                                selectedPaths={selectedPaths}
+                                onToggleSelect={handleToggleSelect}
+                                securityResults={securityResults}
                             />
                         </div>
 
@@ -292,14 +418,18 @@ export function AppShell() {
                                 <PreviewPanel
                                     entry={selectedEntry}
                                     unzipped={unzippedRef.current}
+                                    remoteHandle={remoteHandleRef.current}
                                 />
                             ) : (
-                                <EmptyPreview
+                                <ProjectDashboard
+                                    entries={zipState.entries}
+                                    unzipped={unzippedRef.current}
                                     fileCount={
                                         zipState.entries.filter(
                                             (e) => !e.isDirectory,
                                         ).length
                                     }
+                                    onSelectEntry={handleEntrySelect}
                                 />
                             )}
                         </div>

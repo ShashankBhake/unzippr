@@ -12,15 +12,30 @@ import {
     getPreviewType,
     getFilenameFromUrl,
 } from "./utils";
+import {
+    parseRemoteZip,
+    remoteEntriesToZipEntries,
+    type RemoteZipHandle,
+} from "./zip-remote";
 
 export type { Unzipped } from "fflate";
+export type { RemoteZipHandle } from "./zip-remote";
 
 type ProgressCallback = (progress: number, message: string) => void;
+
+/**
+ * Threshold above which we use Range-based parsing instead of downloading
+ * the entire ZIP. 20MB — below this, full download is fast enough.
+ */
+const RANGE_PARSE_THRESHOLD = 20 * 1024 * 1024;
 
 /** Result returned after parsing a ZIP, includes the parsed data for reuse */
 export interface ParseResult {
     state: ZipState;
+    /** Full in-memory unzipped data (null when using remote/range mode) */
     unzipped: Unzipped | null;
+    /** Handle for on-demand extraction via Range requests (null for local files / small downloads) */
+    remoteHandle: RemoteZipHandle | null;
 }
 
 /**
@@ -45,6 +60,7 @@ export async function parseZipFromFile(
                 progressMessage: "",
             },
             unzipped: null,
+            remoteHandle: null,
         };
     }
 
@@ -76,6 +92,7 @@ export async function parseZipFromFile(
                 progressMessage: "Done!",
             },
             unzipped,
+            remoteHandle: null,
         };
     } catch (err) {
         return {
@@ -92,6 +109,7 @@ export async function parseZipFromFile(
                 progressMessage: "",
             },
             unzipped: null,
+            remoteHandle: null,
         };
     }
 }
@@ -105,11 +123,22 @@ async function fetchAndParseZip(
     onProgress: ProgressCallback,
     expectedSize?: number,
 ): Promise<{ state: ZipState; unzipped: Unzipped }> {
-    const response = await fetch(fetchUrl);
+    const response = await fetch(fetchUrl, {
+        redirect: "follow",
+    });
     if (!response.ok) {
-        throw new Error(
-            `Download failed: ${response.status} ${response.statusText}`,
-        );
+        // If the proxy returned a JSON error, extract the message
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+            const ct = response.headers.get("content-type") || "";
+            if (ct.includes("application/json")) {
+                const body = await response.json();
+                if (body.error) detail = body.error;
+            }
+        } catch {
+            // ignore parse errors
+        }
+        throw new Error(`Download failed: ${detail}`);
     }
 
     const reader = response.body?.getReader();
@@ -180,8 +209,8 @@ async function fetchAndParseZip(
 }
 
 /**
- * Parse a ZIP file from a URL. Tries direct fetch first, falls back to proxy for CORS.
- * Returns the state + the raw buffer for preview extraction.
+ * Parse a ZIP file from a URL. Uses Range-based parsing for large files,
+ * full download for small ones. Tries direct fetch first, falls back to proxy for CORS.
  */
 export async function parseZipFromUrl(
     url: string,
@@ -191,96 +220,252 @@ export async function parseZipFromUrl(
 
     onProgress(5, "Checking server capabilities...");
 
-    // First, try a HEAD request to check size and range support
+    // ── Step 1: Try direct HEAD to check capabilities ────────────────
+    let fetchBaseUrl = url;
+    let proxied = false;
+    let contentLength = 0;
+    let supportsRange = false;
+
     try {
         const headRes = await fetch(url, { method: "HEAD" });
-
-        if (!headRes.ok) {
-            throw new Error(
-                `Server returned ${headRes.status} ${headRes.statusText}`,
+        if (headRes.ok) {
+            contentLength = parseInt(
+                headRes.headers.get("content-length") || "0",
+                10,
             );
+            const acceptRanges = (
+                headRes.headers.get("accept-ranges") || ""
+            ).toLowerCase();
+            supportsRange = acceptRanges.includes("bytes") && contentLength > 0;
+        } else {
+            // HEAD returned non-OK — fall through to proxy
+            throw new Error("DIRECT_FAILED");
         }
+    } catch {
+        // Direct fetch failed for ANY reason (CORS, network, HEAD not supported, etc.)
+        // Always try through proxy — never give up here
+        onProgress(8, "Direct access failed. Trying proxy...");
+        fetchBaseUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+        proxied = true;
 
-        const contentLength = parseInt(
-            headRes.headers.get("content-length") || "0",
-            10,
-        );
-
-        if (contentLength > FILE_SIZE_LIMITS.URL) {
-            return {
-                state: {
-                    status: "error",
-                    fileName,
-                    totalSize: contentLength,
-                    entries: [],
-                    tree: {
-                        name: "",
-                        path: "",
-                        isDirectory: true,
-                        children: [],
-                    },
-                    error: `File too large. Maximum URL file size is ${FILE_SIZE_LIMITS.URL / 1024 / 1024}MB. This file is ${(contentLength / 1024 / 1024).toFixed(1)}MB.`,
-                    loadMethod: "url",
-                    supportsRangeRequests: false,
-                    progress: 0,
-                    progressMessage: "",
-                },
-                unzipped: null,
-            };
+        try {
+            const headController = new AbortController();
+            const headTimeout = setTimeout(() => headController.abort(), 15000);
+            const proxyHeadRes = await fetch(fetchBaseUrl, {
+                method: "HEAD",
+                signal: headController.signal,
+            });
+            clearTimeout(headTimeout);
+            console.log(
+                "[unzippr] Proxy HEAD status:",
+                proxyHeadRes.status,
+                "headers:",
+                Object.fromEntries(proxyHeadRes.headers.entries()),
+            );
+            if (proxyHeadRes.ok) {
+                // Try standard headers first, then custom fallback headers
+                contentLength = parseInt(
+                    proxyHeadRes.headers.get("content-length") ||
+                        proxyHeadRes.headers.get("x-file-size") ||
+                        "0",
+                    10,
+                );
+                const acceptRanges = (
+                    proxyHeadRes.headers.get("accept-ranges") || ""
+                ).toLowerCase();
+                const xRangeSupport =
+                    proxyHeadRes.headers.get("x-range-support");
+                supportsRange =
+                    (acceptRanges.includes("bytes") ||
+                        xRangeSupport === "true") &&
+                    contentLength > 0;
+            }
+            // If HEAD returned non-OK, that's fine — we'll just skip range detection
+            // and proceed with a full download via GET (which is more widely supported)
+        } catch (headErr) {
+            // HEAD through proxy failed or timed out — try a GET range probe instead
+            console.log("[unzippr] Proxy HEAD failed:", headErr);
+            // Attempt a range probe to get both size and range support info
+            try {
+                const probeController = new AbortController();
+                const probeTimeout = setTimeout(
+                    () => probeController.abort(),
+                    10000,
+                );
+                const probeRes = await fetch(fetchBaseUrl, {
+                    method: "GET",
+                    signal: probeController.signal,
+                    headers: { Range: "bytes=0-0" },
+                });
+                clearTimeout(probeTimeout);
+                console.log("[unzippr] Fallback range probe:", probeRes.status);
+                if (probeRes.status === 206) {
+                    supportsRange = true;
+                    const cr = probeRes.headers.get("content-range");
+                    const m = cr?.match(/\/(\d+)/);
+                    if (m) contentLength = parseInt(m[1], 10);
+                }
+                probeController.abort();
+            } catch {
+                console.log("[unzippr] Fallback range probe also failed");
+            }
         }
+    }
 
-        const acceptRanges = headRes.headers.get("accept-ranges");
-        const supportsRange = acceptRanges === "bytes" && contentLength > 0;
+    // ── Step 2: Decide strategy — Range-based or full download ────────
+
+    console.log("[unzippr] After HEAD:", {
+        proxied,
+        contentLength,
+        supportsRange,
+        fetchBaseUrl: fetchBaseUrl.substring(0, 80),
+    });
+
+    // If file is large but range support wasn't detected from headers,
+    // do a quick probe — try fetching 1 byte with Range to check
+    if (!supportsRange && contentLength > RANGE_PARSE_THRESHOLD) {
+        onProgress(8, "Probing range request support...");
+        try {
+            const probeRes = await fetch(fetchBaseUrl, {
+                method: "GET",
+                headers: { Range: "bytes=0-0" },
+            });
+            console.log(
+                "[unzippr] Range probe response:",
+                probeRes.status,
+                Object.fromEntries(probeRes.headers.entries()),
+            );
+            if (probeRes.status === 206) {
+                supportsRange = true;
+                // Also try to get content length from Content-Range if we didn't have it
+                if (!contentLength) {
+                    const cr = probeRes.headers.get("content-range");
+                    const m = cr?.match(/\/(\d+)/);
+                    if (m) contentLength = parseInt(m[1], 10);
+                }
+            }
+            try {
+                await probeRes.body?.cancel();
+            } catch {
+                /* ignore */
+            }
+        } catch (probeErr) {
+            console.log("[unzippr] Range probe failed:", probeErr);
+        }
+    }
+
+    console.log("[unzippr] Decision:", {
+        supportsRange,
+        contentLength,
+        threshold: RANGE_PARSE_THRESHOLD,
+        useLazy: supportsRange && contentLength > RANGE_PARSE_THRESHOLD,
+    });
+
+    const useLazyParsing =
+        supportsRange && contentLength > RANGE_PARSE_THRESHOLD;
+
+    if (useLazyParsing) {
+        // ── Range-based parsing: only download Central Directory ──────
         onProgress(
             10,
-            supportsRange
-                ? "Server supports streaming!"
-                : "Downloading file...",
+            `Large file (${(contentLength / 1024 / 1024).toFixed(0)}MB). Using smart parsing — only fetching file listing...`,
         );
 
-        return await fetchAndParseZip(
-            url,
+        try {
+            const handle = await parseRemoteZip(
+                fetchBaseUrl,
+                (msg) => onProgress(15, msg),
+                contentLength,
+            );
+
+            const entries = remoteEntriesToZipEntries(handle.entries);
+            const tree = buildTree(entries, fileName.replace(/\.zip$/i, ""));
+
+            onProgress(100, "Done!");
+
+            return {
+                state: {
+                    status: "loaded",
+                    fileName,
+                    totalSize: handle.fileSize,
+                    entries,
+                    tree,
+                    error: null,
+                    loadMethod: "url",
+                    supportsRangeRequests: true,
+                    progress: 100,
+                    progressMessage: "Done!",
+                },
+                unzipped: null,
+                remoteHandle: handle,
+            };
+        } catch (rangeErr) {
+            // Range parsing failed — fall through to full download
+            const msg =
+                rangeErr instanceof Error ? rangeErr.message : "Unknown error";
+            if (msg === "RANGE_NOT_SUPPORTED") {
+                onProgress(
+                    10,
+                    "Range requests not supported, downloading full file...",
+                );
+            } else {
+                onProgress(
+                    10,
+                    `Smart parsing failed (${msg}), downloading full file...`,
+                );
+            }
+        }
+    }
+
+    // ── Full download path ───────────────────────────────────────────
+    onProgress(
+        10,
+        supportsRange ? "Server supports streaming!" : "Downloading file...",
+    );
+
+    try {
+        const { state, unzipped } = await fetchAndParseZip(
+            fetchBaseUrl,
             fileName,
             onProgress,
             contentLength || undefined,
         );
-    } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        const isCors =
-            message.includes("Failed to fetch") ||
-            message.includes("CORS") ||
-            message.includes("NetworkError");
 
-        // If it's a CORS error, try again through our proxy
-        if (isCors) {
-            onProgress(
-                10,
-                "Direct fetch blocked by CORS. Retrying through proxy...",
-            );
+        // For URL-loaded ZIPs: also create a remoteHandle if the server
+        // supports Range requests. This enables the share button (direct
+        // download links) even for small ZIPs that were fully downloaded.
+        let remoteHandle: RemoteZipHandle | null = null;
+        if (supportsRange && contentLength > 0) {
             try {
-                const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
-                return await fetchAndParseZip(proxyUrl, fileName, onProgress);
+                remoteHandle = await parseRemoteZip(
+                    fetchBaseUrl,
+                    () => {}, // silent — no progress needed
+                    contentLength,
+                );
             } catch {
-                // Proxy also failed, show the error below
+                // Non-critical — share just won't work
             }
         }
 
+        return { state, unzipped, remoteHandle };
+    } catch (fetchErr) {
+        const fetchMessage =
+            fetchErr instanceof Error ? fetchErr.message : "Unknown error";
         return {
             state: {
                 status: "error",
                 fileName,
-                totalSize: 0,
+                totalSize: contentLength,
                 entries: [],
                 tree: { name: "", path: "", isDirectory: true, children: [] },
-                error: isCors
-                    ? `CORS error: The server doesn't allow cross-origin requests and proxy fallback also failed. Try a direct download link from a CDN or file host that supports CORS (GitHub releases, S3 with CORS, etc.).`
-                    : `Failed to load ZIP from URL: ${message}`,
+                error: `Failed to download and parse ZIP: ${fetchMessage}`,
                 loadMethod: "url",
-                supportsRangeRequests: false,
+                supportsRangeRequests: supportsRange,
                 progress: 0,
                 progressMessage: "",
             },
             unzipped: null,
+            remoteHandle: null,
         };
     }
 }
@@ -358,7 +543,7 @@ export function extractFileForPreview(
                 };
             }
 
-            const content = extractOfficeText(data, ext);
+            const content = extractOfficeTextFromData(data, ext);
             if (content !== null) {
                 return {
                     status: "loaded",
@@ -424,7 +609,10 @@ export function extractFileForPreview(
  * DOCX, XLSX, PPTX are ZIP archives with XML content inside.
  * Returns structured content (JSON for rich rendering, TSV for spreadsheets).
  */
-function extractOfficeText(fileData: Uint8Array, ext: string): string | null {
+export function extractOfficeTextFromData(
+    fileData: Uint8Array,
+    ext: string,
+): string | null {
     try {
         const inner = unzipSync(fileData);
 
@@ -770,7 +958,7 @@ function buildEntries(unzipped: Unzipped): ZipEntry[] {
  * Parse CSV text into TSV format (tab-separated) for consistent spreadsheet rendering.
  * Handles quoted fields, embedded commas, and escaped quotes.
  */
-function parseCsvToTsv(csv: string): string {
+export function parseCsvToTsv(csv: string): string {
     const lines: string[] = [];
     const rows = parseCsvRows(csv);
     for (const row of rows) {
@@ -810,25 +998,32 @@ function parseCsvRows(csv: string): string[][] {
                 }
                 row.push(field);
                 // Skip comma or newline after field
-                if (i < len && csv[i] === ',') {
+                if (i < len && csv[i] === ",") {
                     i++;
-                } else if (i < len && (csv[i] === '\n' || csv[i] === '\r')) {
-                    if (csv[i] === '\r' && i + 1 < len && csv[i + 1] === '\n') i++;
+                } else if (i < len && (csv[i] === "\n" || csv[i] === "\r")) {
+                    if (csv[i] === "\r" && i + 1 < len && csv[i + 1] === "\n")
+                        i++;
                     i++;
                     break;
                 }
             } else {
                 // Unquoted field
                 let field = "";
-                while (i < len && csv[i] !== ',' && csv[i] !== '\n' && csv[i] !== '\r') {
+                while (
+                    i < len &&
+                    csv[i] !== "," &&
+                    csv[i] !== "\n" &&
+                    csv[i] !== "\r"
+                ) {
                     field += csv[i];
                     i++;
                 }
                 row.push(field);
-                if (i < len && csv[i] === ',') {
+                if (i < len && csv[i] === ",") {
                     i++;
-                } else if (i < len && (csv[i] === '\n' || csv[i] === '\r')) {
-                    if (csv[i] === '\r' && i + 1 < len && csv[i + 1] === '\n') i++;
+                } else if (i < len && (csv[i] === "\n" || csv[i] === "\r")) {
+                    if (csv[i] === "\r" && i + 1 < len && csv[i + 1] === "\n")
+                        i++;
                     i++;
                     break;
                 }

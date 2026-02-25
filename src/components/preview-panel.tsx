@@ -29,6 +29,9 @@ import {
     Info,
     Table,
     AlignLeft,
+    Share2,
+    Check,
+    Link,
 } from "lucide-react";
 import {
     ZipEntry,
@@ -40,18 +43,30 @@ import {
     extractFileForPreview,
     extractFileForDownload,
 } from "@/lib/zip-handler";
-import type { Unzipped } from "@/lib/zip-handler";
+import type { Unzipped, RemoteZipHandle } from "@/lib/zip-handler";
+import {
+    extractRemoteFile,
+    downloadRemoteFile,
+    getStreamingMediaUrl,
+    getDirectFileUrl,
+} from "@/lib/zip-remote";
 import { formatBytes, getExtension, getPreviewType } from "@/lib/utils";
 import { FileIcon } from "./file-icon";
 import { CodePreview } from "./code-preview";
 import { MetadataPanel } from "./metadata-panel";
+import { ShareDialog } from "./share-dialog";
 
 interface PreviewPanelProps {
     entry: ZipEntry;
     unzipped: Unzipped | null;
+    remoteHandle: RemoteZipHandle | null;
 }
 
-export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
+export function PreviewPanel({
+    entry,
+    unzipped,
+    remoteHandle,
+}: PreviewPanelProps) {
     const [preview, setPreview] = useState<PreviewState>({
         status: "idle",
         entry: null,
@@ -61,10 +76,16 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
         error: null,
     });
     const [showMetadata, setShowMetadata] = useState(false);
+    const [shareDialogOpen, setShareDialogOpen] = useState(false);
+    const [shareLink, setShareLink] = useState<string | null>(null);
+    const [shareLoading, setShareLoading] = useState(false);
+    const [shareCopied, setShareCopied] = useState(false);
 
     const previewType = useMemo(() => getPreviewType(entry.path), [entry.path]);
     const ext = useMemo(() => getExtension(entry.path), [entry.path]);
     const language = LANGUAGE_MAP[ext] || "text";
+
+    const isRemoteMode = remoteHandle !== null && unzipped === null;
 
     useEffect(() => {
         // Clean up previous blob URL
@@ -72,7 +93,7 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
             URL.revokeObjectURL(preview.blobUrl);
         }
 
-        if (!unzipped) {
+        if (!unzipped && !remoteHandle) {
             setPreview({
                 status: "error",
                 entry,
@@ -85,15 +106,21 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
         }
 
         if (entry.size > FILE_SIZE_LIMITS.PREVIEW) {
-            setPreview({
-                status: "error",
-                entry,
-                type: previewType,
-                content: null,
-                blobUrl: null,
-                error: `File too large for preview (${formatBytes(entry.size)}). Maximum preview size is ${formatBytes(FILE_SIZE_LIMITS.PREVIEW)}.`,
-            });
-            return;
+            // In remote mode, video/audio can be streamed without size limits
+            const canStream =
+                isRemoteMode &&
+                (previewType === "video" || previewType === "audio");
+            if (!canStream) {
+                setPreview({
+                    status: "error",
+                    entry,
+                    type: previewType,
+                    content: null,
+                    blobUrl: null,
+                    error: `File too large for preview (${formatBytes(entry.size)}). Maximum preview size is ${formatBytes(FILE_SIZE_LIMITS.PREVIEW)}.`,
+                });
+                return;
+            }
         }
 
         if (previewType === "unsupported") {
@@ -117,17 +144,96 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
             error: null,
         });
 
-        // Use setTimeout to avoid blocking the UI
+        if (isRemoteMode && remoteHandle) {
+            // On-demand extraction via Range requests
+            let cancelled = false;
+
+            // For video/audio: try streaming URL first (no full download needed)
+            if (previewType === "video" || previewType === "audio") {
+                getStreamingMediaUrl(remoteHandle, entry.path).then(
+                    (streamUrl) => {
+                        if (cancelled) return;
+                        if (streamUrl) {
+                            // Use streaming URL directly — browser handles Range/buffering
+                            setPreview({
+                                status: "loaded",
+                                entry,
+                                type: previewType,
+                                content: null,
+                                blobUrl: streamUrl,
+                                error: null,
+                            });
+                        } else {
+                            // Fallback: full extraction (DEFLATE files)
+                            extractRemoteFile(remoteHandle, entry.path).then(
+                                (result) => {
+                                    if (!cancelled) {
+                                        setPreview({
+                                            ...result,
+                                            entry,
+                                            type: result.type || previewType,
+                                        });
+                                    }
+                                },
+                            );
+                        }
+                    },
+                );
+            } else {
+                extractRemoteFile(remoteHandle, entry.path).then((result) => {
+                    if (!cancelled) {
+                        setPreview({
+                            ...result,
+                            entry,
+                            type: result.type || previewType,
+                        });
+                    }
+                });
+            }
+
+            return () => {
+                cancelled = true;
+            };
+        }
+
+        // In-memory extraction
         const timer = setTimeout(() => {
-            const result = extractFileForPreview(unzipped, entry.path);
+            const result = extractFileForPreview(unzipped!, entry.path);
             setPreview({ ...result, entry, type: previewType });
         }, 50);
 
         return () => clearTimeout(timer);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [entry.path, unzipped]);
+    }, [entry.path, unzipped, remoteHandle]);
 
-    const handleDownload = useCallback(() => {
+    const handleDownload = useCallback(async () => {
+        if (isRemoteMode && remoteHandle) {
+            // On-demand download via Range requests
+            const url = await downloadRemoteFile(remoteHandle, entry.path);
+            if (url) {
+                if (url.startsWith("__STREAM__")) {
+                    // Large STORED file — open streaming proxy URL directly
+                    const streamUrl = url.slice("__STREAM__".length);
+                    window.open(streamUrl, "_blank");
+                } else {
+                    // Small file — blob URL, use normal download
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = entry.name;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }
+            } else {
+                // null = file too large for in-browser decompression
+                alert(
+                    `This file (${(entry.size / 1024 / 1024).toFixed(0)}MB) uses compression and is too large to extract in the browser. Download the full ZIP instead.`,
+                );
+            }
+            return;
+        }
+
         if (!unzipped) return;
         const url = extractFileForDownload(unzipped, entry.path);
         if (url) {
@@ -139,7 +245,49 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
         }
-    }, [unzipped, entry]);
+    }, [unzipped, remoteHandle, isRemoteMode, entry]);
+
+    // Build shareable URL for this file (only works when loaded via URL)
+    const shareUrl = useMemo(() => {
+        if (typeof window === "undefined") return null;
+        const params = new URLSearchParams(window.location.search);
+        if (!params.has("url")) return null; // drag & drop — can't share
+        const url = new URL(window.location.href);
+        url.searchParams.set("path", entry.path);
+        return url.toString();
+    }, [entry.path]);
+
+    const canShare = remoteHandle !== null;
+
+    const handleShare = useCallback(() => {
+        setShareDialogOpen(true);
+        setShareLink(null);
+        setShareLoading(true);
+        setShareCopied(false);
+        // Start fetching the link
+        (async () => {
+            if (!canShare || !remoteHandle) return;
+            const directUrl = await getDirectFileUrl(remoteHandle, entry.path);
+            if (!directUrl) {
+                setShareLoading(false);
+                setShareLink(null);
+                return;
+            }
+            const absoluteUrl = directUrl.startsWith("http")
+                ? directUrl
+                : `${window.location.origin}${directUrl}`;
+            setShareLink(absoluteUrl);
+            setShareLoading(false);
+        })();
+    }, [canShare, remoteHandle, entry.path]);
+
+    const handleCopyShareLink = useCallback(() => {
+        if (!shareLink) return;
+        navigator.clipboard.writeText(shareLink).then(() => {
+            setShareCopied(true);
+            setTimeout(() => setShareCopied(false), 2000);
+        });
+    }, [shareLink]);
 
     return (
         <div className="flex flex-col h-full">
@@ -170,6 +318,24 @@ export function PreviewPanel({ entry, unzipped }: PreviewPanelProps) {
                     >
                         <Info className="w-3.5 h-3.5" />
                     </button>
+                    {canShare && (
+                        <button
+                            onClick={handleShare}
+                            className="btn-ghost text-xs py-1.5 px-2"
+                            title="Share direct download link"
+                        >
+                            <Share2 className="w-3.5 h-3.5" />
+                        </button>
+                    )}
+                    {/* Share dialog */}
+                    <ShareDialog
+                        open={shareDialogOpen}
+                        onClose={() => setShareDialogOpen(false)}
+                        link={shareLink}
+                        loading={shareLoading}
+                        copied={shareCopied}
+                        onCopy={handleCopyShareLink}
+                    />
                     <button
                         onClick={handleDownload}
                         className="btn-secondary text-xs py-1.5 px-2 sm:px-3"
@@ -1241,7 +1407,10 @@ function SpreadsheetPreview({
         );
     }
 
-    const rows = content.split("\n").filter(r => r.trim()).map((row) => row.split("\t"));
+    const rows = content
+        .split("\n")
+        .filter((r) => r.trim())
+        .map((row) => row.split("\t"));
     const maxCols = Math.max(...rows.map((r) => r.length));
     const isCSV = ext === ".csv" || ext === ".tsv";
 
@@ -1251,7 +1420,11 @@ function SpreadsheetPreview({
             <div className="flex items-center gap-2 px-3 sm:px-4 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-green-50/50 dark:bg-green-950/20">
                 <Sheet className="w-4 h-4 text-green-500 shrink-0" />
                 <span className="text-[10px] sm:text-xs font-medium text-green-600 dark:text-green-400 truncate">
-                    {isCSV ? `${ext.replace(".", "").toUpperCase()} data` : "Spreadsheet data — Sheet 1"} · {rows.length} rows · {maxCols} col{maxCols !== 1 ? "s" : ""}
+                    {isCSV
+                        ? `${ext.replace(".", "").toUpperCase()} data`
+                        : "Spreadsheet data — Sheet 1"}{" "}
+                    · {rows.length} rows · {maxCols} col
+                    {maxCols !== 1 ? "s" : ""}
                 </span>
                 <div className="flex-1" />
                 {/* Table / Text toggle */}

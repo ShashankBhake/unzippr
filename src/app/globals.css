@@ -180,6 +180,11 @@
         bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300;
 }
 
+@utility badge-danger {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium
+        bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-300;
+}
+
 /* --- Non-utility styles --- */
 .syntax-highlighter {
     border-radius: 0.75rem !important;

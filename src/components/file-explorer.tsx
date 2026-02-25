@@ -1,10 +1,19 @@
 "use client";
 
 import React, { useState, useMemo, useCallback } from "react";
-import { Search, ChevronRight, ChevronDown } from "lucide-react";
+import {
+    Search,
+    ChevronRight,
+    ChevronDown,
+    ShieldAlert,
+    ShieldX,
+    CheckSquare2,
+    Square,
+} from "lucide-react";
 import { TreeNode, ZipEntry } from "@/lib/types";
 import { formatBytes, searchEntries } from "@/lib/utils";
 import { FileIcon } from "./file-icon";
+import { SecurityScanResult } from "@/lib/magic-bytes";
 
 interface FileExplorerProps {
     tree: TreeNode;
@@ -13,6 +22,10 @@ interface FileExplorerProps {
     searchQuery: string;
     onSearchChange: (query: string) => void;
     onSelect: (entry: ZipEntry) => void;
+    selectMode?: boolean;
+    selectedPaths?: Set<string>;
+    onToggleSelect?: (path: string) => void;
+    securityResults?: Map<string, SecurityScanResult> | null;
 }
 
 export function FileExplorer({
@@ -22,6 +35,10 @@ export function FileExplorer({
     searchQuery,
     onSearchChange,
     onSelect,
+    selectMode = false,
+    selectedPaths,
+    onToggleSelect,
+    securityResults,
 }: FileExplorerProps) {
     const searchResults = useMemo(() => {
         if (!searchQuery.trim()) return null;
@@ -52,6 +69,10 @@ export function FileExplorer({
                         selectedPath={selectedPath}
                         onSelect={onSelect}
                         query={searchQuery}
+                        selectMode={selectMode}
+                        selectedPaths={selectedPaths}
+                        onToggleSelect={onToggleSelect}
+                        securityResults={securityResults}
                     />
                 ) : (
                     <TreeView
@@ -59,10 +80,31 @@ export function FileExplorer({
                         selectedPath={selectedPath}
                         onSelect={onSelect}
                         depth={0}
+                        selectMode={selectMode}
+                        selectedPaths={selectedPaths}
+                        onToggleSelect={onToggleSelect}
+                        securityResults={securityResults}
                     />
                 )}
             </div>
         </div>
+    );
+}
+
+// --- Security indicator ---
+function SecurityIndicator({ result }: { result?: SecurityScanResult }) {
+    if (!result || result.level === "safe") return null;
+    if (result.level === "danger") {
+        return (
+            <span title={result.message}>
+                <ShieldX className="w-3 h-3 text-red-500 shrink-0" />
+            </span>
+        );
+    }
+    return (
+        <span title={result.message}>
+            <ShieldAlert className="w-3 h-3 text-amber-500 shrink-0" />
+        </span>
     );
 }
 
@@ -73,18 +115,33 @@ interface TreeViewProps {
     selectedPath: string | null;
     onSelect: (entry: ZipEntry) => void;
     depth: number;
+    selectMode?: boolean;
+    selectedPaths?: Set<string>;
+    onToggleSelect?: (path: string) => void;
+    securityResults?: Map<string, SecurityScanResult> | null;
 }
 
-function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
+function TreeView({
+    node,
+    selectedPath,
+    onSelect,
+    depth,
+    selectMode,
+    selectedPaths,
+    onToggleSelect,
+    securityResults,
+}: TreeViewProps) {
     const [expanded, setExpanded] = useState(node.isExpanded ?? depth < 1);
 
     const handleClick = useCallback(() => {
         if (node.isDirectory) {
             setExpanded((e) => !e);
+        } else if (selectMode && onToggleSelect) {
+            onToggleSelect(node.path);
         } else if (node.entry) {
             onSelect(node.entry);
         }
-    }, [node, onSelect]);
+    }, [node, onSelect, selectMode, onToggleSelect]);
 
     // Don't render the root node itself, just its children
     if (depth === 0) {
@@ -97,6 +154,10 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
                         selectedPath={selectedPath}
                         onSelect={onSelect}
                         depth={depth + 1}
+                        selectMode={selectMode}
+                        selectedPaths={selectedPaths}
+                        onToggleSelect={onToggleSelect}
+                        securityResults={securityResults}
                     />
                 ))}
             </div>
@@ -104,6 +165,8 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
     }
 
     const isSelected = selectedPath === node.path;
+    const isChecked = selectedPaths?.has(node.path) ?? false;
+    const secResult = securityResults?.get(node.path);
 
     return (
         <div>
@@ -113,6 +176,17 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
                 onClick={handleClick}
                 title={node.path}
             >
+                {/* Checkbox in select mode */}
+                {selectMode && !node.isDirectory && (
+                    <span className="shrink-0 w-4 h-4 flex items-center justify-center">
+                        {isChecked ? (
+                            <CheckSquare2 className="w-3.5 h-3.5 text-brand-500" />
+                        ) : (
+                            <Square className="w-3.5 h-3.5 text-neutral-400" />
+                        )}
+                    </span>
+                )}
+
                 {/* Expand/collapse chevron for directories */}
                 {node.isDirectory ? (
                     <span className="shrink-0 w-4 h-4 flex items-center justify-center">
@@ -123,7 +197,7 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
                         )}
                     </span>
                 ) : (
-                    <span className="w-4" />
+                    !selectMode && <span className="w-4" />
                 )}
 
                 <FileIcon
@@ -134,6 +208,9 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
                 />
 
                 <span className="truncate text-xs">{node.name}</span>
+
+                {/* Security indicator */}
+                <SecurityIndicator result={secResult} />
 
                 {!node.isDirectory && node.entry && (
                     <span className="ml-auto text-[10px] text-neutral-400 dark:text-neutral-500 shrink-0 tabular-nums">
@@ -151,6 +228,10 @@ function TreeView({ node, selectedPath, onSelect, depth }: TreeViewProps) {
                             selectedPath={selectedPath}
                             onSelect={onSelect}
                             depth={depth + 1}
+                            selectMode={selectMode}
+                            selectedPaths={selectedPaths}
+                            onToggleSelect={onToggleSelect}
+                            securityResults={securityResults}
                         />
                     ))}
                     {node.children.length === 0 && (
@@ -174,6 +255,10 @@ interface SearchResultsListProps {
     selectedPath: string | null;
     onSelect: (entry: ZipEntry) => void;
     query: string;
+    selectMode?: boolean;
+    selectedPaths?: Set<string>;
+    onToggleSelect?: (path: string) => void;
+    securityResults?: Map<string, SecurityScanResult> | null;
 }
 
 function SearchResultsList({
@@ -181,6 +266,10 @@ function SearchResultsList({
     selectedPath,
     onSelect,
     query,
+    selectMode,
+    selectedPaths,
+    onToggleSelect,
+    securityResults,
 }: SearchResultsListProps) {
     if (results.length === 0) {
         return (
@@ -195,31 +284,51 @@ function SearchResultsList({
             <div className="px-3 py-1.5 text-[10px] font-medium text-neutral-400 dark:text-neutral-500 uppercase tracking-wider">
                 {results.length} result{results.length !== 1 ? "s" : ""}
             </div>
-            {results.map((entry) => (
-                <div
-                    key={entry.path}
-                    className={`tree-item ${selectedPath === entry.path ? "tree-item-active" : ""}`}
-                    onClick={() => onSelect(entry)}
-                    title={entry.path}
-                >
-                    <FileIcon
-                        name={entry.name}
-                        isDirectory={false}
-                        className="w-4 h-4 shrink-0"
-                    />
-                    <div className="flex flex-col min-w-0">
-                        <span className="truncate text-xs font-medium">
-                            {entry.name}
-                        </span>
-                        <span className="truncate text-[10px] text-neutral-400 dark:text-neutral-500">
-                            {entry.path}
+            {results.map((entry) => {
+                const isChecked = selectedPaths?.has(entry.path) ?? false;
+                const secResult = securityResults?.get(entry.path);
+                return (
+                    <div
+                        key={entry.path}
+                        className={`tree-item ${selectedPath === entry.path ? "tree-item-active" : ""}`}
+                        onClick={() => {
+                            if (selectMode && onToggleSelect) {
+                                onToggleSelect(entry.path);
+                            } else {
+                                onSelect(entry);
+                            }
+                        }}
+                        title={entry.path}
+                    >
+                        {selectMode && (
+                            <span className="shrink-0 w-4 h-4 flex items-center justify-center">
+                                {isChecked ? (
+                                    <CheckSquare2 className="w-3.5 h-3.5 text-brand-500" />
+                                ) : (
+                                    <Square className="w-3.5 h-3.5 text-neutral-400" />
+                                )}
+                            </span>
+                        )}
+                        <FileIcon
+                            name={entry.name}
+                            isDirectory={false}
+                            className="w-4 h-4 shrink-0"
+                        />
+                        <div className="flex flex-col min-w-0">
+                            <span className="truncate text-xs font-medium">
+                                {entry.name}
+                            </span>
+                            <span className="truncate text-[10px] text-neutral-400 dark:text-neutral-500">
+                                {entry.path}
+                            </span>
+                        </div>
+                        <SecurityIndicator result={secResult} />
+                        <span className="ml-auto text-[10px] text-neutral-400 shrink-0 tabular-nums">
+                            {formatBytes(entry.size)}
                         </span>
                     </div>
-                    <span className="ml-auto text-[10px] text-neutral-400 shrink-0 tabular-nums">
-                        {formatBytes(entry.size)}
-                    </span>
-                </div>
-            ))}
+                );
+            })}
         </div>
     );
 }

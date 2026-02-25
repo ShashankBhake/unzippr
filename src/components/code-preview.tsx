@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo } from "react";
-import { Light as SyntaxHighlighter } from "react-syntax-highlighter";
+import SyntaxHighlighter from "react-syntax-highlighter";
 import {
     atomOneDark,
     atomOneLight,
