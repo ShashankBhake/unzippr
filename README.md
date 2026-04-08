@@ -2,6 +2,16 @@
 
 A minimal, stylish web app that lets you explore ZIP file contents without downloading them. Supports direct file upload and URL input with streaming download progress.
 
+## Limits
+
+| Input Method        | Max Size |
+| ------------------- | -------- |
+| File Upload         | 200 MB   |
+| URL                 | 500 MB   |
+| Single File Preview | 25 MB    |
+
+Nah, I'm kidding with these limits. Try me :)
+
 ## Features
 
 - 📁 **Drag & Drop** or file picker to open local ZIP files
@@ -16,14 +26,6 @@ A minimal, stylish web app that lets you explore ZIP file contents without downl
 - 🌗 **Dark/Light Mode** — auto-detects system preference with manual toggle
 - 🔒 **100% Client-Side** — nothing is uploaded to any server
 - ⚡ **Fast** — powered by fflate for blazing-fast ZIP parsing
-
-## Limits
-
-| Input Method        | Max Size |
-| ------------------- | -------- |
-| File Upload         | 200 MB   |
-| URL                 | 500 MB   |
-| Single File Preview | 25 MB    |
 
 ## Tech Stack
 
